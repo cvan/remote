@@ -1,4 +1,3 @@
-const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const url = require('url');
@@ -11,11 +10,18 @@ const bodyParser = require('body-parser');
 const ecstatic = require('ecstatic');
 const express = require('express');
 const expressPouchDB = require('express-pouchdb');
-const PouchDB = require('pouchdb');
+const fs = require('fs-extra');
+const internalIp = require('internal-ip');
+const passwordless = require('passwordless');
+const pouchdb = require('pouchdb');
+const PouchStore = require('passwordless-pouchstore');
 const resisdown = require('redisdown');
+const session = require('express-session');
 const SocketPeer = require('socketpeer');
 const trailingSlash = require('trailing-slash');
 const twilio = require('twilio');
+
+const PouchBase = require('./pouchbase.js');
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -25,11 +31,27 @@ const corsHeaders = {
   'Access-Control-Expose-Headers': 'Location'
 };
 
+const dataDirName = 'data';
+const dataDir = path.join(__dirname, '..', dataDirName);
 const host = process.env.SOCKETPEER_HOST || process.env.HOST || '0.0.0.0';
 const port = parseFloat(process.env.SOCKETPEER_PORT || process.env.PORT || '3000');
 const nodeEnv = process.env.NODE_ENV || 'development';
 
+const serverIp = internalIp.v4.sync();
+const serverOrigin = nodeEnv === 'production' ? 'https://remote.webvr.rocks' : `http://${serverIp}:${port}`;
+
 const app = express();
+
+fs.ensureDirSync(dataDir);
+fs.ensureDirSync(path.join(dataDir, 'core'));
+fs.ensureDirSync(path.join(dataDir, 'tmp'));
+
+const PouchDB = pouchdb.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/core/`});
+
+const TmpPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/tmp/`});
+const PublicPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/public/`});
+
+const pb = new PouchBase(serverOrigin + '/', PouchDB);
 
 const httpServer = http.createServer(app);
 const ecstaticMiddleware = ecstatic({
@@ -147,9 +169,14 @@ function cors (req, res) {
   return true;
 }
 
-function sms (req, res) {
+function jsonOrUrlencodedParser (req) {
   const contentType = req.headers['content-type'] || '';
   const parser = contentType.includes('json') ? bodyParser.json() : bodyParser.urlencoded({extended: false});
+  return parser;
+}
+
+function sms (req, res) {
+  const parser = jsonOrUrlencodedParser(req);
 
   // Values taken from the Twilio dashboard:
   //
@@ -165,8 +192,6 @@ function sms (req, res) {
   const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
   const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
   const twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER;
-
-  console.log(process.env);
 
   if (!twilioAccountSid || !twilioAuthToken || !twilioPhoneNumber) {
     let twilioErr;
@@ -186,7 +211,7 @@ function sms (req, res) {
 
   const twilioClient = new twilio(twilioAccountSid, twilioAuthToken);
 
-  return parser(req, res, next);
+  return Promise.resolve(parser(req, res, next));
 
   function next () {
     const smsBody = req.body.body;
@@ -221,9 +246,37 @@ function sms (req, res) {
   }
 }
 
-const redisdownPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL});
+// const redisdownPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL});
 
-app.use('/db/', expressPouchDB(redisdownPouchDB));
+// const POUCHDB_DB_NAME = 'passwordless-tokens';
+//
+// passwordless.init(new PouchStore(POUCHDB_DB_NAME, {
+//   db: resisdown,
+//   url: process.env.REDIS_URL
+// }));
+//
+// passwordless.addDelivery((tokenToSend, uidToSend, recipient, callback, req) => {
+//   // Send out a token.
+//   const msg = {
+//     text: `Hello, sign in here: ${host}?token=${tokenToSend}&uid=${encodeURIComponent(uidToSend)}`,
+//     from: 'webmaster@play.webvr.rocks',
+//     to: recipient,
+//     subject: `Token for ${host}`
+//   };
+//
+//   req.body.to = recipient;
+//   req.body.body = msg.text;
+//
+//   console.log('Sending token via SMS');
+//
+//   sms(req, res).then(success => {
+//     console.log('Successfully sent SMS');
+//   }).catch(err => {
+//     console.error('Could not send SMS:', err);
+//   });
+// });
+
+// app.use('/db/', expressPouchDB(redisdownPouchDB));
 
 app.use((req, res, next) => {
   if (req.path.startsWith('/socketpeer/')) {
@@ -240,10 +293,15 @@ app.use((req, res, next) => {
     return redirect(req, res, pathnameClean);
   }
 
-  trailingSlash({slash: false})(req, res, next);
+  trailingSlash({slash: false})(req, res, function () {
+    session({
+      secret: 'keyboard cat',
+      maxAge: 1000 * 60 * 60 * 24 * 30
+    })(req, res, next);
+  });
 });
 
-app.all('*/index.html$', (req, res, next) => {
+app.all('*/index.html$', (req, res) => {
   const parsedUrl = url.parse(req.originalUrl);
 
   parsedUrl.pathname = req.path.replace(/\/index.html$/, '') || '/';
@@ -253,9 +311,160 @@ app.all('*/index.html$', (req, res, next) => {
   redirect(req, res, redirectUrl);
 });
 
-app.post('/sms', (req, res, next) => {
+app.post('/sms', (req, res) => {
   sms(req, res);
 });
+
+
+// app.get('/', (req, res) => { res.render('testserver'); });
+app.get('/tmp/', (req, res) => { res.render('testserver'); });
+app.get('/public/', (req, res) => { res.render('datasets'); });
+app.get('/user/', (req, res) => { res.render('userdb'); });
+
+// Temporary database requires no authentication, so forward the user directly.
+app.use('/db/tmp/', expressPouchDB(TmpPouchDB));
+
+// Public databases will allow users to read but not write data.
+function unauthorized (req, res, next) {
+  res.status(401).send({
+    error: true,
+    message: 'Unauthorized'
+  });
+  next();
+}
+
+app.post('/db/public/*', unauthorized);
+app.delete('/db/public/*', unauthorized);
+app.put('/db/public/*', unauthorized);
+app.use('/db/public', expressPouchDB(PublicPouchDB));
+
+// User databases require the user to be logged in
+app.use('/db/users/', (req, res, next) => {
+  if (!req.session.user) {
+    console.warn('Unauthorized database access');
+    return unauthorized(req, res, next);
+  }
+
+  const dbName = pb.usersDbName(req.session.user, req.headers.origin);
+  req.url = '/' + dbName + '/' + req.url.substring(1);
+  next();
+});
+app.use('/db/users', expressPouchDB(PouchDB));
+
+app.all('/session/', function (req, res, next) {
+  console.log('•••', req.path);
+  if (!req.session.user) {
+    console.warn('Unauthorized database access');
+    return unauthorized(req, res, next);
+  } else {
+    next();
+  }
+});
+
+app.get('/session/', function (req, res) {
+  console.log('•••', req.path);
+  const parser = jsonOrUrlencodedParser(req);
+  parser(req, res, () => {
+    pb.readSession(req.session.user, req.headers.origin)
+      .then(function (result) {
+        res.send(result);
+      });
+  });
+});
+
+app.post('/session/', function (req, res) {
+  console.log('•••', req.path);
+  const parser = jsonOrUrlencodedParser(req);
+  parser(req, res, () => {
+    pb.writeSession(req.session.user, req.headers.origin, req.body)
+      .then(function (result) {
+        res.send(result);
+      });
+  });
+});
+
+app.post('/login/', function (req, res) {
+  console.log('•••', req.path);
+  const parser = jsonOrUrlencodedParser(req);
+  parser(req, res, () => {
+    console.log('req.body', req.body);
+    pb.login(req.body, req.headers.origin).then(function (result) {
+      res.send(result);
+    });
+  });
+});
+
+app.use(bodyParser.urlencoded({extended: false}));
+
+app.all('/validate/', function (req, res) {
+  console.log('•••', req.path);
+  // const parser = jsonOrUrlencodedParser(req);
+  // parser(req, res, () => {
+    console.log(req.body, req.query);
+    var uid = req.query.uid;
+    var token = req.query.token;
+    var host = req.query.host;
+    pb.authenticate(uid, host, token).then(function (result) {
+      if (result.ok) {
+        req.session.user = req.query.uid;
+      }
+      if (req.method === 'GET' && result.origin) {
+        res.redirect(result.origin);
+      } else {
+        res.send(result);
+      }
+    });
+});
+
+app.post('/logout/', function (req, res) {
+  console.log('•••', req.path);
+  const parser = jsonOrUrlencodedParser(req);
+  parser(req, res, () => {
+    req.session = null;
+    res.send({ok: true});
+  });
+});
+
+// app.get('/session', (req, res, next) => {
+//   const corsHandled = cors(req, res);
+//   if (!corsHandled) {
+//     return;
+//   }
+//
+//   const parser = jsonOrUrlencodedParser(req);
+//
+//   parser(req, res, function () {
+//     session({
+//       keys: ['keyboard', 'cat'],
+//       maxAge: 1000 * 60 * 60 * 24 * 30
+//     })(req, res, function () {
+//       passwordless.sessionSupport()(req, res, function () {
+//         passwordless.acceptToken()(req, res, function () {
+//           console.log(req.path);
+//           res.json({
+//             ok: true,
+//             user: 'email@domain.com',
+//             db: serverOrigin + '/db'
+//           });
+//         });
+//       });
+//     });
+//   });
+//
+//   // app.use(passwordless.sessionSupport());
+//   // app.use(passwordless.acceptToken());
+// });
+
+// app.post('/', passwordless.requestToken(function (user, delivery, callback) {
+//         // lookup your user from supplied phone number
+//         // `user` is the value from your html input (by default an input with name = 'user')
+//         // for this example we're just return the supplied number
+//         callback(null, user);
+//     }),
+//     function (req, res) {
+//         res.render('verify', { uid: req.passwordless.uidToAuth });
+//     }
+// );
 
 app.use((req, res, next) => {
   if (req.path.startsWith('/socketpeer/')) {
@@ -277,7 +486,7 @@ app.use((req, res, next) => {
 
 if (!module.parent) {
   app.listen(port, host, () => {
-    console.log('[%s] Server listening on %s:%s', nodeEnv, host, port);
+    console.log('[%s] Server running on %s', nodeEnv, serverOrigin);
   });
 }
 

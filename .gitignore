@@ -2,6 +2,8 @@
 .env
 *.log
 *.rdb
+/data/
 /log*.txt
 /logs
+/sample/
 node_modules
