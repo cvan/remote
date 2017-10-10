@@ -1,9 +1,13 @@
+.config.json
 .DS_Store
 .env
 *.log
 *.rdb
+/_replicator/
+/_users/
 /data/
 /log*.txt
 /logs
+/pouch__all_dbs__
 /sample/
 node_modules

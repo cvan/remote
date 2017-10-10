@@ -7,21 +7,24 @@ dotenv.config({path: path.join(__dirname, '..')});
 dotenv.load();
 
 const bodyParser = require('body-parser');
+const cookieParser = require('cookie-parser');  // TODO: Remove.
 const ecstatic = require('ecstatic');
 const express = require('express');
 const expressPouchDB = require('express-pouchdb');
+const expressSession = require('express-session');
 const fs = require('fs-extra');
 const internalIp = require('internal-ip');
+const levelup = require('levelup');
+const methodOverride = require('method-override');
 const passwordless = require('passwordless');
-const pouchdb = require('pouchdb');
+const PouchDB = require('pouchdb');
 const PouchStore = require('passwordless-pouchstore');
 const resisdown = require('redisdown');
-const session = require('express-session');
 const SocketPeer = require('socketpeer');
 const trailingSlash = require('trailing-slash');
 const twilio = require('twilio');
 
-const PouchBase = require('./pouchbase.js');
+// const PouchBase = require('./pouchbase.js');
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -36,22 +39,26 @@ const dataDir = path.join(__dirname, '..', dataDirName);
 const host = process.env.SOCKETPEER_HOST || process.env.HOST || '0.0.0.0';
 const port = parseFloat(process.env.SOCKETPEER_PORT || process.env.PORT || '3000');
 const nodeEnv = process.env.NODE_ENV || 'development';
-
-const serverIp = internalIp.v4.sync();
-const serverOrigin = nodeEnv === 'production' ? 'https://remote.webvr.rocks' : `http://${serverIp}:${port}`;
+const redisUrl = process.env.REDIS_URL || process.env.REDISCLOUD_URL;
 
 const app = express();
 
-fs.ensureDirSync(dataDir);
-fs.ensureDirSync(path.join(dataDir, 'core'));
-fs.ensureDirSync(path.join(dataDir, 'tmp'));
+app.set('host', host);
+app.set('port', port);
 
-const PouchDB = pouchdb.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/core/`});
+const serverIp = internalIp.v4.sync();
+const serverOrigin = nodeEnv === 'production' ? 'https://remote.webvr.rocks' : `http://${serverIp}:${app.get('port')}`;
 
-const TmpPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/tmp/`});
-const PublicPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/public/`});
+// fs.ensureDirSync(dataDir);
+// fs.ensureDirSync(path.join(dataDir, 'core'));
+// fs.ensureDirSync(path.join(dataDir, 'tmp'));
 
-const pb = new PouchBase(serverOrigin + '/', PouchDB);
+// const PouchDB = pouchdb.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/core/`});
+//
+// const TmpPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/tmp/`});
+// const PublicPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL, prefix: `./${dataDirName}/public/`});
+
+// const pb = new PouchBase(serverOrigin + '/', PouchDB);
 
 const httpServer = http.createServer(app);
 const ecstaticMiddleware = ecstatic({
@@ -71,6 +78,9 @@ const staticPaths = [
   '/client.js',
   '/tachyons.min.css'
 ];
+
+app.set('views', path.join(__dirname, 'templates'));
+app.set('view engine', 'ejs');
 
 let pins = {};
 
@@ -246,37 +256,111 @@ function sms (req, res) {
   }
 }
 
-// const redisdownPouchDB = PouchDB.defaults({db: resisdown, url: process.env.REDIS_URL});
+const db = levelup('xr', {db: resisdown, url: redisUrl});
+const redisdownPouchDB = PouchDB.defaults({
+  db: db,
+  prefix: `./${dataDirName}/`
+});
 
-// const POUCHDB_DB_NAME = 'passwordless-tokens';
-//
-// passwordless.init(new PouchStore(POUCHDB_DB_NAME, {
-//   db: resisdown,
-//   url: process.env.REDIS_URL
-// }));
-//
-// passwordless.addDelivery((tokenToSend, uidToSend, recipient, callback, req) => {
-//   // Send out a token.
-//   const msg = {
-//     text: `Hello, sign in here: ${host}?token=${tokenToSend}&uid=${encodeURIComponent(uidToSend)}`,
-//     from: 'webmaster@play.webvr.rocks',
-//     to: recipient,
-//     subject: `Token for ${host}`
-//   };
-//
-//   req.body.to = recipient;
-//   req.body.body = msg.text;
-//
-//   console.log('Sending token via SMS');
-//
-//   sms(req, res).then(success => {
-//     console.log('Successfully sent SMS');
-//   }).catch(err => {
-//     console.error('Could not send SMS:', err);
-//   });
-// });
+app.use('/db/', expressPouchDB(PouchDB, {
+  configPath: path.join(__dirname, 'config.json'),
+  db: redisdownPouchDB
+}));
 
-// app.use('/db/', expressPouchDB(redisdownPouchDB));
+const POUCHDB_DB_NAME = 'xr:passwordlessTokens';
+passwordless.init(new PouchStore(POUCHDB_DB_NAME, {db: db}));
+passwordless.addDelivery('sms', (tokenToSend, uidToSend, recipient, callback, req) => {
+  // Send out a token.
+  const msg = {
+    text: `Hello, sign in here: ${serverOrigin}/api/login?token=${tokenToSend}&uid=${encodeURIComponent(uidToSend)}`,
+    from: 'webmaster@play.webvr.rocks',
+    to: recipient,
+    subject: `Proceed to sign in to ${serverOrigin} …`
+  };
+
+  console.log('Sending message …', msg);
+
+  req.body.to = recipient;
+  req.body.body = msg.text;
+
+  console.log('Sending token via SMS');
+
+  sms(req, res).then(success => {
+    console.log('Successfully sent SMS');
+  }).catch(err => {
+    console.error('Could not send SMS:', err);
+  });
+}, {
+  ttl: 100 * 60 * 10
+});
+
+const api = express.Router();
+api.use(methodOverride());
+api.use(cookieParser(process.env.SESSION_SECRET));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({extended: false}));
+api.use(expressSession({
+  secret: process.env.SESSION_SECRET,
+  maxAge: 1000 * 60 * 60 * 24 * 30,
+  saveUninitialized: false,
+  resave: false
+}));
+api.use(passwordless.sessionSupport());
+api.use(passwordless.acceptToken({
+  enableOriginRedirect: true,
+  successRedirect: '/api/index'
+}));
+api.get('/index', (req, res) => {
+  res.render('index', {title: 'Index'});
+});
+api.post('/sendtoken', passwordless.requestToken((user, delivery, callback, req) => {
+  if (delivery === 'sms') {
+    // Look up phone number.
+  } else if (delivery === 'email') {
+    // Look up email.
+  }
+
+  // User.find({email: user}, result => {
+  //   if (result) {
+  //     return callback(null, result.id);
+  //   }
+  //   callback(null, null);
+  // });
+
+  callback(null, user);
+}), (req, res) => {
+  // res.render('verify', {uid: req.passwordless.uidToAuth});
+  res.send(`sent uid: ${req.passwordless.uidToAuth}`);
+});
+api.get('/login', (req, res) => {
+  res.render('login', {title: 'Log in'});
+});
+api.post('/login', passwordless.requestToken((user, delivery, callback) => {
+  console.log('/login request');
+  // Identify user.
+
+  // look up your user from the supplied phone number.
+  // `user` is the value from your html input (by default an input with name = 'user')
+  // for this example we're just return the supplied number
+  callback(null, user);
+}), {
+  failureRedirect: '/login'
+}, (req, res) => {
+  // Success.
+  console.log('/login verify');
+  res.json({
+    state: 'verify',
+    uid: req.passwordless.uidToAuth
+  });
+});
+api.post('/verify', passwordless.acceptToken({allowPost: true, successRedirect: '/api/users'}));
+api.get('/users', passwordless.restricted({originField: 'to', failureRedirect: '/api/login?to=/api/users'}), (req, res) => {
+  res.json({
+    'name': 'users',
+    'objects': []
+  });
+});
+app.use('/api', api);
 
 app.use((req, res, next) => {
   if (req.path.startsWith('/socketpeer/')) {
@@ -293,12 +377,7 @@ app.use((req, res, next) => {
     return redirect(req, res, pathnameClean);
   }
 
-  trailingSlash({slash: false})(req, res, function () {
-    session({
-      secret: 'keyboard cat',
-      maxAge: 1000 * 60 * 60 * 24 * 30
-    })(req, res, next);
-  });
+  trailingSlash({slash: false})(req, res, next);
 });
 
 app.all('*/index.html$', (req, res) => {
@@ -315,14 +394,13 @@ app.post('/sms', (req, res) => {
   sms(req, res);
 });
 
-
 // app.get('/', (req, res) => { res.render('testserver'); });
-app.get('/tmp/', (req, res) => { res.render('testserver'); });
-app.get('/public/', (req, res) => { res.render('datasets'); });
-app.get('/user/', (req, res) => { res.render('userdb'); });
+// app.get('/tmp/', (req, res) => { res.render('testserver'); });
+// app.get('/public/', (req, res) => { res.render('datasets'); });
+// app.get('/user/', (req, res) => { res.render('userdb'); });
 
 // Temporary database requires no authentication, so forward the user directly.
-app.use('/db/tmp/', expressPouchDB(TmpPouchDB));
+// app.use('/db/tmp/', expressPouchDB(TmpPouchDB));
 
 // Public databases will allow users to read but not write data.
 function unauthorized (req, res, next) {
@@ -333,36 +411,36 @@ function unauthorized (req, res, next) {
   next();
 }
 
-app.post('/db/public/*', unauthorized);
-app.delete('/db/public/*', unauthorized);
-app.put('/db/public/*', unauthorized);
-app.use('/db/public', expressPouchDB(PublicPouchDB));
+// app.post('/db/public/*', unauthorized);
+// app.delete('/db/public/*', unauthorized);
+// app.put('/db/public/*', unauthorized);
+// app.use('/db/public', expressPouchDB(PublicPouchDB));
 
 // User databases require the user to be logged in
-app.use('/db/users/', (req, res, next) => {
-  if (!req.session.user) {
-    console.warn('Unauthorized database access');
-    return unauthorized(req, res, next);
-  }
+// app.use('/db/users/', (req, res, next) => {
+//   if (!req.session.user) {
+//     console.warn('Unauthorized database access');
+//     return unauthorized(req, res, next);
+//   }
+//
+//   const dbName = pb.usersDbName(req.session.user, req.headers.origin);
+//   req.url = '/' + dbName + '/' + req.url.substring(1);
+//   next();
+// });
+// app.use('/db/users', expressPouchDB(PouchDB));
 
-  const dbName = pb.usersDbName(req.session.user, req.headers.origin);
-  req.url = '/' + dbName + '/' + req.url.substring(1);
-  next();
-});
-app.use('/db/users', expressPouchDB(PouchDB));
+// app.all('/session/', function (req, res, next) {
+//   console.log('•••', req.path);
+//   if (!req.session.user) {
+//     console.warn('Unauthorized database access');
+//     return unauthorized(req, res, next);
+//   } else {
+//     next();
+//   }
+// });
 
-app.all('/session/', function (req, res, next) {
-  console.log('•••', req.path);
-  if (!req.session.user) {
-    console.warn('Unauthorized database access');
-    return unauthorized(req, res, next);
-  } else {
-    next();
-  }
-});
-
+/*
 app.get('/session/', function (req, res) {
-  console.log('•••', req.path);
   const parser = jsonOrUrlencodedParser(req);
   parser(req, res, () => {
     pb.readSession(req.session.user, req.headers.origin)
@@ -373,7 +451,6 @@ app.get('/session/', function (req, res) {
 });
 
 app.post('/session/', function (req, res) {
-  console.log('•••', req.path);
   const parser = jsonOrUrlencodedParser(req);
   parser(req, res, () => {
     pb.writeSession(req.session.user, req.headers.origin, req.body)
@@ -384,7 +461,6 @@ app.post('/session/', function (req, res) {
 });
 
 app.post('/login/', function (req, res) {
-  console.log('•••', req.path);
   const parser = jsonOrUrlencodedParser(req);
   parser(req, res, () => {
     console.log('req.body', req.body);
@@ -394,13 +470,9 @@ app.post('/login/', function (req, res) {
   });
 });
 
-app.use(bodyParser.urlencoded({extended: false}));
-
 app.all('/validate/', function (req, res) {
-  console.log('•••', req.path);
-  // const parser = jsonOrUrlencodedParser(req);
-  // parser(req, res, () => {
-    console.log(req.body, req.query);
+  const parser = jsonOrUrlencodedParser(req);
+  parser(req, res, () => {
     var uid = req.query.uid;
     var token = req.query.token;
     var host = req.query.host;
@@ -414,57 +486,17 @@ app.all('/validate/', function (req, res) {
         res.send(result);
       }
     });
+  });
 });
 
 app.post('/logout/', function (req, res) {
-  console.log('•••', req.path);
   const parser = jsonOrUrlencodedParser(req);
   parser(req, res, () => {
     req.session = null;
     res.send({ok: true});
   });
 });
-
-// app.get('/session', (req, res, next) => {
-//   const corsHandled = cors(req, res);
-//   if (!corsHandled) {
-//     return;
-//   }
-//
-//   const parser = jsonOrUrlencodedParser(req);
-//
-//   parser(req, res, function () {
-//     session({
-//       keys: ['keyboard', 'cat'],
-//       maxAge: 1000 * 60 * 60 * 24 * 30
-//     })(req, res, function () {
-//       passwordless.sessionSupport()(req, res, function () {
-//         passwordless.acceptToken()(req, res, function () {
-//           console.log(req.path);
-//           res.json({
-//             ok: true,
-//             user: 'email@domain.com',
-//             db: serverOrigin + '/db'
-//           });
-//         });
-//       });
-//     });
-//   });
-//
-//   // app.use(passwordless.sessionSupport());
-//   // app.use(passwordless.acceptToken());
-// });
-
-// app.post('/', passwordless.requestToken(function (user, delivery, callback) {
-//         // lookup your user from supplied phone number
-//         // `user` is the value from your html input (by default an input with name = 'user')
-//         // for this example we're just return the supplied number
-//         callback(null, user);
-//     }),
-//     function (req, res) {
-//         res.render('verify', { uid: req.passwordless.uidToAuth });
-//     }
-// );
+*/
 
 app.use((req, res, next) => {
   if (req.path.startsWith('/socketpeer/')) {
@@ -485,7 +517,7 @@ app.use((req, res, next) => {
 });
 
 if (!module.parent) {
-  app.listen(port, host, () => {
+  app.listen(app.get('port'), app.get('host'), () => {
     console.log('[%s] Server running on %s', nodeEnv, serverOrigin);
   });
 }
