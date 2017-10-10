@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111">
+    <title><%= title %></title>
+  </head>
+  <body>
+    <h1><%= title %></h1>
+    <form action="/api/sendtoken" method="post">
+      <fieldset>
+        <legend><%= title %></legend>
+        <label class="db">
+          <span class="label-text">
+            Email address
+          </span>
+          <input type="<%= userFieldType || 'email' %>" name="user" placeholder="Email address">
+        </label>
+        <input type="hidden" name="uid" value="<%= uid %>">
+        <input type="hidden" name="to" value="<%= to %>">
+        <button type="submit"><%= title %></button>
+      </fieldset>
+    </form>
+  </body>
+</html>
