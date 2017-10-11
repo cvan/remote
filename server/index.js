@@ -256,19 +256,33 @@ function sms (req, res) {
   }
 }
 
+const api = express.Router();
+api.use(methodOverride());
+api.use(cookieParser());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({extended: false}));
+api.use(expressSession({
+  secret: process.env.SESSION_SECRET,
+  // maxAge: 1000 * 60 * 60 * 24 * 30,
+  saveUninitialized: false,
+  resave: false
+}));
+
 const db = levelup('xr', {db: resisdown, url: redisUrl});
 const redisdownPouchDB = PouchDB.defaults({
   db: db,
   prefix: `./${dataDirName}/`
 });
 
-app.use('/db/', expressPouchDB(PouchDB, {
+app.use('/db', expressPouchDB(PouchDB, {
   configPath: path.join(__dirname, 'config.json'),
   db: redisdownPouchDB
 }));
 
-const POUCHDB_DB_NAME = 'xr:passwordlessTokens';
-passwordless.init(new PouchStore(POUCHDB_DB_NAME, {db: db}));
+const passwordlessPouchDBStore = new PouchStore('xr:passwordlessTokens', {
+  db: redisdownPouchDB
+});
+passwordless.init(passwordlessPouchDBStore);
 passwordless.addDelivery((tokenToSend, uidToSend, recipient, callback, req) => {
   // Send out a token.
   const msg = {
@@ -316,24 +330,43 @@ passwordless.addDelivery((tokenToSend, uidToSend, recipient, callback, req) => {
 //   ttl: 100 * 60 * 10
 // });
 
-const api = express.Router();
-api.use(methodOverride());
-api.use(cookieParser());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({extended: false}));
-api.use(expressSession({
-  secret: process.env.SESSION_SECRET,
-  // maxAge: 1000 * 60 * 60 * 24 * 30,
-  saveUninitialized: false,
-  resave: false
-}));
+app.use((req, res, next) => {
+  if (req.path.startsWith('/socketpeer/')) {
+    return;
+  }
+
+  // Helper method for prepending routed namespaces to URLs (e.g., `res.locals.getUrl('/<url>')` → `/api/<url>`).
+  res.locals.getUrl = url => req.baseUrl + url;
+
+  const pathnameClean = req.path.replace(/\/+$/g, '/').replace(/\/$/, '') || '/';
+
+  if (pathnameClean === '/') {
+    return redirect(req, res, '/' + generatePinCode());
+  }
+
+  if (req.path !== pathnameClean) {
+    return redirect(req, res, pathnameClean);
+  }
+
+  trailingSlash({slash: false})(req, res, next);
+});
+
 api.use(passwordless.sessionSupport());
 api.use(passwordless.acceptToken({
   enableOriginRedirect: true,
   successRedirect: '/api/index'
 }));
+api.get('/', (req, res) => {
+  res.redirect(res.locals.getUrl('/index'));
+  res.end();
+});
 api.get('/index', (req, res) => {
   res.render('index', {title: 'Index'});
+  res.end();
+});
+api.get('/sendtoken', (req, res) => {
+  res.redirect(res.locals.getUrl('/login'));
+  res.end();
 });
 api.post('/sendtoken', passwordless.requestToken((user, delivery, callback) => {
   console.log('send token');
@@ -359,11 +392,23 @@ api.post('/sendtoken', passwordless.requestToken((user, delivery, callback) => {
 }), (req, res) => {
   console.log('send token callback');
   res.render('index', {title: 'Verify ' + req.passwordless.uidToAuth});
+  res.end();
 });
 api.get('/session', passwordless.restricted({originField: 'to'}), (req, res) => {
   res.render('index', {
     title: 'Session'
   });
+  res.end();
+});
+api.get('/users', passwordless.restricted({
+  originField: 'to',
+  failureRedirect: `/api/login?to=${encodeURIComponent('/api/login')}`
+}), (req, res) => {
+  res.json({
+    'name': 'users',
+    'objects': []
+  });
+  res.end();
 });
 api.get('/login', (req, res) => {
   const userFieldType = req.query.type === 'phone' ? 'phone' : 'email';
@@ -373,43 +418,31 @@ api.get('/login', (req, res) => {
     uid: '',
     to: ''
   });
+  res.end();
 });
-api.get('/logout', passwordless.restricted({originField: 'to'}), (req, res) => {
+api.get('/logout', passwordless.restricted({
+  originField: 'to'
+}), (req, res) => {
   res.render('index', {
     title: 'Log out'
   });
+  res.end();
 });
 api.post('/logout', passwordless.logout(), (req, res) => {
-  res.redirect('/api/index');
+  res.redirect(res.locals.getUrl('/index'));
+  res.end();
 });
-api.post('/verify', passwordless.acceptToken({allowPost: true, successRedirect: '/api/users'}), (req, res) => {
+api.post('/verify', passwordless.acceptToken({
+  allowPost: true,
+  successRedirect: '/api/users'
+}), (req, res) => {
   console.log('verify success');
-});
-api.get('/users', passwordless.restricted({originField: 'to', failureRedirect: '/api/login?to=/api/users'}), (req, res) => {
-  res.json({
-    'name': 'users',
-    'objects': []
+  res.render('index', {
+    title: 'Sucess'
   });
+  res.end();
 });
-app.use('/api', api);
-
-app.use((req, res, next) => {
-  if (req.path.startsWith('/socketpeer/')) {
-    return;
-  }
-
-  const pathnameClean = req.path.replace(/\/+$/g, '/').replace(/\/$/, '') || '/';
-
-  if (pathnameClean === '/') {
-    return redirect(req, res, '/' + generatePinCode());
-  }
-
-  if (req.path !== pathnameClean) {
-    return redirect(req, res, pathnameClean);
-  }
-
-  trailingSlash({slash: false})(req, res, next);
-});
+app.use('/api',  api);
 
 app.all('*/index.html$', (req, res) => {
   const parsedUrl = url.parse(req.originalUrl);
