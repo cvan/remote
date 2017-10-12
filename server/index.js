@@ -268,19 +268,24 @@ api.use(expressSession({
   resave: false
 }));
 
-const db = levelup('xr', {db: resisdown, url: redisUrl});
-const redisdownPouchDB = PouchDB.defaults({
-  db: db,
-  prefix: `./${dataDirName}/`
-});
+// const db = levelup('xr', {db: resisdown, url: redisUrl});
+// const db = levelup('xr', {db: resisdown});
+// const redisdownPouchDB = PouchDB.defaults({
+//   // db: db,
+//   prefix: `./${dataDirName}/`
+// });
+const db = new PouchDB('xr');
 
-app.use('/db', expressPouchDB(PouchDB, {
-  configPath: path.join(__dirname, 'config.json'),
-  db: redisdownPouchDB
-}));
+// app.use('/db', expressPouchDB(redisdownPouchDB, {
+//   configPath: path.join(__dirname, 'config.json'),
+//   db: redisdownPouchDB
+// }));
 
-const passwordlessPouchDBStore = new PouchStore('xr:passwordlessTokens', {
-  db: redisdownPouchDB
+// console.log('redisdownPouchDB', Object.keys(db), Object.keys(redisdownPouchDB));
+
+const passwordlessPouchDBStore = new PouchStore('xr', {
+  db: db
+  // db: redisdownPouchDB
 });
 passwordless.init(passwordlessPouchDBStore);
 passwordless.addDelivery((tokenToSend, uidToSend, recipient, callback, req) => {
